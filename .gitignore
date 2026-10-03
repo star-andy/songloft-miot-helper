@@ -1,3 +1,6 @@
 .songloft-dev.json
 node_modules/
 dist/
+
+# 一次性诊断插件（不在主仓版本管理内；想纳入版本库删掉此行即可）
+probe/

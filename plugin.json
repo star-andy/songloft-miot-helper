@@ -1,8 +1,8 @@
 {
   "$schema": "https://raw.githubusercontent.com/songloft-org/plugin-toolchain/main/schemas/plugin.schema.json",
   "name": "小爱语音助手",
-  "version": "0.8.0",
-  "description": "小爱音箱语音口令扩展，自定义语音搜索，播放LXMusic、WebDAV、MusicFree中歌单和歌曲",
+  "version": "0.9.6",
+  "description": "小爱音箱语音口令扩展，自定义语音搜索，播放LXMusic、WebDAV、MusicFree中歌单和歌曲，支持大模型问答接管",
   "author": "birdstudy-nj",
   "homepage": "https://github.com/birdstudy-nj/songloft-miot-helper",
   "license": "Apache-2.0",

@@ -279,6 +279,7 @@
         <button class="mh-tab" data-target="tab-webdav">WebDAV</button>
         <button class="mh-tab" data-target="tab-resume">续播</button>
         <button class="mh-tab" data-target="tab-expert">专家</button>
+        <button class="mh-tab" data-target="tab-qa">问答</button>
         <button class="mh-tab" data-target="tab-about">关于</button>
       </div>
 
@@ -644,6 +645,228 @@
         <div id="ex-cmd-containers"></div>
       </div>
     </div>
+    <div id="tab-qa" class="mh-pane">
+      <div class="card">
+        <div style="display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 12px; flex-wrap: wrap;">
+          <div class="card-title" style="margin: 0;">🧠 问答接管 (AI 大脑)</div>
+          <input type="checkbox" id="qa-enabled" class="mh-switch-input" checked title="启用/停用问答接管">
+        </div>
+        <p class="desc" style="margin-bottom: 12px; line-height: 1.6;">
+          说出「触发口令 + 你的问题」（例如「问问今天北京天气怎么样」），插件会先打断小爱自己的应答，再让大模型生成回答并朗读。
+          触发口令之后的词会原样交给模型，不会被动平台搜索词规则删改。
+        </p>
+        <div id="qa-status" style="font-size: 12px; padding: 8px 10px; border-radius: 6px; background: var(--md-surface-variant, rgba(0,0,0,0.04)); margin-bottom: 16px; line-height: 1.6;"></div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">触发口令词</label>
+          <input type="text" id="qa-cmds" class="mh-input" placeholder="问问, 问一下">
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">多个口令用逗号分隔。建议选不容易与歌曲搜索混淆的词。</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-title">🔌 大模型接口 (OpenAI 兼容)</div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">供应商预设</label>
+          <select id="qa-preset" class="mh-select">
+            <option value="siliconflow">硅基流动 SiliconFlow (推荐)</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="openai">OpenAI</option>
+            <option value="moonshot">Kimi 月之暗面</option>
+            <option value="zhipu">智谱 GLM</option>
+            <option value="custom">自定义</option>
+          </select>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">切换预设会自动填入接口地址、模型名与扩展字段，之后只需再填 API Key。</div>
+        </div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">接口地址</label>
+          <input type="text" id="qa-url" class="mh-input" placeholder="https://api.siliconflow.cn/v1/chat/completions">
+        </div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">API Key</label>
+          <input type="password" id="qa-key" class="mh-input" placeholder="sk-...">
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">仅保存在本机插件数据库中，不会外传。</div>
+        </div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">模型名</label>
+          <div style="display: flex; gap: 8px; align-items: stretch;">
+            <input type="text" id="qa-model" class="mh-input" list="qa-model-list" placeholder="点「获取模型」拉取，或直接输入" style="flex: 1; min-width: 0;">
+            <button type="button" class="mh-btn" id="qa-btn-models" style="white-space: nowrap;">📋 获取模型</button>
+          </div>
+          <datalist id="qa-model-list"></datalist>
+          <div id="qa-model-tip" style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">点「获取模型」会从接口拉取可用模型列表，之后点输入框即可下拉选择。也可以直接手动输入。</div>
+        </div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">扩展字段 (JSON，可选)</label>
+          <input type="text" id="qa-extra" class="mh-input" placeholder='{"enable_thinking": false}'>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">用于透传各家私有参数。推理模型必须带 <code>enable_thinking: false</code>，否则会先吐思维链、延迟翻好几倍。</div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-title">🎭 人设与长度控制</div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">人设提示词</label>
+          <textarea id="qa-persona" class="mh-input" style="height: 88px; resize: vertical; line-height: 1.5; padding: 8px 12px; box-sizing: border-box; font-family: inherit; width: 100%;"></textarea>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">只描述性格与语气。口语化、字数上限、禁用格式符号等硬约束由插件内置强制，改写人设不会破坏它们。</div>
+        </div>
+
+        <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+          <div class="mh-field" style="flex: 1; min-width: 140px;">
+            <label style="font-weight: bold; color: var(--md-on-surface);">回答字数上限</label>
+            <input type="number" id="qa-maxchars" class="mh-input" placeholder="150">
+          </div>
+          <div class="mh-field" style="flex: 1; min-width: 140px;">
+            <label style="font-weight: bold; color: var(--md-on-surface);">max_tokens</label>
+            <input type="number" id="qa-maxtokens" class="mh-input" placeholder="256">
+          </div>
+          <div class="mh-field" style="flex: 1; min-width: 140px;">
+            <label style="font-weight: bold; color: var(--md-on-surface);">请求超时 (秒)</label>
+            <input type="number" id="qa-timeout" class="mh-input" placeholder="12">
+          </div>
+        </div>
+
+        <div style="font-size: 11px; color: var(--md-on-surface-variant); line-height: 1.6;">
+          实测大模型约 18~20 毫秒/字，400 字要等 7 秒以上。<b>字数上限</b>负责截断兜底，<b>max_tokens</b> 负责从源头限制 —— 两道闸只设一个都不保险。
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-title">🎯 接管时机</div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">什么时候让大模型回答</label>
+          <select id="qa-mode" class="mh-select">
+            <option value="fallback">只补位：小爱答不上来时才接管（推荐）</option>
+            <option value="takeover">全接管：每次都掐掉小爱、改念大模型的</option>
+          </select>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px; line-height: 1.6;">
+            <b>真机实测：连续下发 4 次停止指令，小爱的原生回答照样念完了。</b>
+            设备侧的语音播报起播时机不可控，我们抢不过它 —— 硬抢就会变成「先说一遍小爱的、再说一遍模型的」。
+            所以默认改成<b>只补位</b>：小爱答得上来我们就闭嘴，只有它说「抱歉，暂不支持」这类话时才让大模型上。
+          </div>
+        </div>
+
+        <div class="mh-field" id="qa-field-patterns">
+          <label style="font-weight: bold; color: var(--md-on-surface);">小爱「答不上来」的特征词（每行一个）</label>
+          <textarea id="qa-fail-patterns" class="mh-input" style="height: 120px; resize: vertical; line-height: 1.5; padding: 8px 12px; box-sizing: border-box; font-family: inherit; width: 100%;"></textarea>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px; line-height: 1.6;">
+            原生回答命中其中任意一个，就判定为「小爱没答上来」，交给大模型。判定前会抹掉标点与空格，
+            所以「抱歉，目前暂不支持该功能」能命中「暂不支持」。<b>清空表示永不接管</b>。
+          </div>
+          <div style="margin-top: 6px;">
+            <button class="mh-btn" id="qa-btn-reset-patterns" type="button">↩️ 恢复默认词表</button>
+          </div>
+        </div>
+
+        <div class="mh-field" id="qa-field-wait">
+          <label style="font-weight: bold; color: var(--md-on-surface);">等待原生回答 (毫秒)</label>
+          <input type="number" id="qa-wait-native" class="mh-input" placeholder="800">
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">
+            小爱的回答通常与指令同一帧到达；万一慢一拍，最多再等这么久再判定。设 0 表示不等（到点没有就当它没答上来）。
+          </div>
+        </div>
+
+        <div class="mh-field" id="qa-field-freeroute">
+          <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+            <input type="checkbox" id="qa-free-fallback" class="mh-switch-input">
+            <span style="font-weight: bold; color: var(--md-on-surface);">自由补位：不喊口令词也接管</span>
+          </label>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px; line-height: 1.6;">
+            开着之后，你直接跟小爱聊天、<b>没喊「问问」</b>，但它回了「对不起，我还在学习中」这类答不上来的话，
+            也会交给大模型补位。<b>只在小爱明确答不上来时才接管</b> —— 正常指令（下一首、暂停、天气…）
+            小爱都有回答，不会被抢。默认关闭：没有口令词就没有归属边界，开着可能被无关对话触发。
+          </div>
+        </div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">调用前先提示一声（可选）</label>
+          <select id="qa-ai-hint" class="mh-select">
+            <option value="off">不提示</option>
+            <option value="tts">语音提示：说一句「稍等，我查一下」</option>
+            <option value="sound">播放前置提示音（复用全局设置里的那首）</option>
+          </select>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px; line-height: 1.6;">
+            判定为「需要接管」之后、模型返回之前，先跟用户打个招呼，避免他以为音箱没听见。
+            提示是<b>和大模型请求并行</b>的，不额外增加等待时间。
+            ⚠️ 开启后会<b>自动改用单发打断</b> —— 连续打断窗口会把你自己刚播的提示语掐掉。
+          </div>
+        </div>
+
+        <div class="mh-field" id="qa-field-hint-text" style="display: none;">
+          <label style="font-weight: bold; color: var(--md-on-surface);">提示语文案</label>
+          <input type="text" id="qa-ai-hint-text" class="mh-input" placeholder="稍等，我查一下">
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">
+            越短越好，1~2 秒念完最舒服。写太长会拖慢整体节奏（模型答得比它慢时才不会额外等待）。
+          </div>
+        </div>
+
+        <div class="mh-field" id="qa-field-hint-hold" style="display: none;">
+          <label style="font-weight: bold; color: var(--md-on-surface);">提示语最短占位 (毫秒)</label>
+          <input type="number" id="qa-ai-hint-hold" class="mh-input" placeholder="1600">
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">
+            答案要等提示语播完才下发，避免两者互相切断。模型耗时超过这个值时就以模型为准。
+          </div>
+        </div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">🔍 试判一句原生回答</label>
+          <input type="text" id="qa-judge-input" class="mh-input" placeholder="粘贴一句小爱的回答，如：抱歉，目前暂不支持该功能">
+          <div style="display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 6px;">
+            <button class="mh-btn" id="qa-btn-judge" type="button">判定</button>
+            <span id="qa-judge-result" style="font-size: 12px; color: var(--md-on-surface-variant);"></span>
+          </div>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">
+            用当前词表判定，不调大模型、不下发到音箱。真机上听到小爱答了什么，直接粘进来试。
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-title">🔇 打断小爱原生应答</div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">打断方式</label>
+          <select id="qa-interrupt-mode" class="mh-select">
+            <option value="burst">连续打断</option>
+            <option value="once">只打断一次</option>
+          </select>
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px; line-height: 1.6;">
+            <b>仅「全接管」模式下用得上</b>（补位模式下小爱答上来了我们根本不出声，无需打断）。
+            你说「问问…」时，小爱会先把它自己的回答念出来，本插件随后打断、改念大模型的回答。
+            但<b>设备什么时候起播我们看不到</b> —— 可能收到文字之前就开念了，也可能还要再等一两秒才起播。
+            只打一发停止指令，万一正好落在它起播前的空档上就会空转。
+            <b>连续打断</b>会在等待大模型期间反复下发停止指令，直到答案就绪才收手。
+            ⚠️ 真机上这一招目前<b>没能压住</b>小爱的播报，所以它只是个可开关的备选，不是默认路径。
+          </div>
+        </div>
+
+        <div class="mh-field">
+          <label style="font-weight: bold; color: var(--md-on-surface);">打断间隔 (毫秒)</label>
+          <input type="number" id="qa-interrupt-interval" class="mh-input" placeholder="350">
+          <div style="font-size: 11px; color: var(--md-on-surface-variant); margin-top: 4px;">
+            仅「连续打断」时生效，指两发停止指令之间的真实间隔（单次下发本身的往返约 130 毫秒会被自动扣除）。
+            间隔越小越不容易漏掉起播，但下发越频繁。350 毫秒是个折中；改小到 200 附近更保险。
+          </div>
+        </div>
+      </div>
+
+      <div class="card" style="margin-top: 12px;">
+        <div class="card-title" style="margin-bottom: 12px;">🧪 测试连接</div>
+        <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+          <button class="mh-btn" id="qa-btn-test">▶️ 测试调用</button>
+          <span style="font-size: 12px; color: var(--md-on-surface-variant);">用当前表单配置发一条测试问题，只在本页显示，不推送到音箱。</span>
+        </div>
+        <div id="qa-test-result" style="display: none; margin-top: 12px;"></div>
+      </div>
+    </div>
+
     <div id="tab-about" class="mh-pane">
       <div class="card">
         <div style="text-align: center; padding: 12px 0 0;">
@@ -652,7 +875,7 @@
           <div style="margin-top: 6px; font-size: 13px; color: var(--md-on-surface-variant); font-weight: 500;">
             智能音箱的语音口令扩展
           </div>
-          <p class="desc" style="margin-top: 4px; font-size: 12px; opacity: 0.7;">SongLoft MIoT Helper v0.7.2</p>
+          <p class="desc" style="margin-top: 4px; font-size: 12px; opacity: 0.7;">SongLoft MIoT Helper v0.9.6</p>
         </div>
 
         <div class="mh-divider"></div>
@@ -950,13 +1173,23 @@
           <input type="checkbox" id="toggle-conversation-monitor" class="mh-switch-input" title="开启/关闭对话监听">
         </div>
         <p class="desc">实时截获并显示小爱音箱的原始语音对话指令。</p>
-        <pre id="ws-logs" style="height: 120px; color: #61dafb; background: #25232A; padding: 12px; border-radius: 8px; overflow-y: auto; font-size: 13px; margin: 0; white-space: pre-wrap;">等待语音输入...</pre>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap;">
+          <button class="mh-btn" data-copy-target="ws-logs" type="button">📋 复制</button>
+          <button class="mh-btn" data-pause-target="ws-logs" type="button">⏸ 暂停刷新</button>
+        </div>
+        <pre id="ws-logs" style="height: 120px; color: #61dafb; background: #25232A; padding: 12px; border-radius: 8px; overflow-y: auto; font-size: 13px; margin: 0; white-space: pre-wrap; user-select: text; -webkit-user-select: text;">等待语音输入...</pre>
       </div>
 
       <div class="card">
         <div class="card-title">🚀 后端执行引擎日志</div>
         <p class="desc">实时显示搜歌、删单、建单、推送等底层执行步骤。</p>
-        <pre id="backend-logs" style="height: 450px; color: #a6e22e; background: #25232A; padding: 12px; border-radius: 8px; overflow-y: auto; font-size: 13px; margin: 0; white-space: pre-wrap;">加载中...</pre>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; align-items: center;">
+          <button class="mh-btn" data-copy-target="backend-logs" type="button">📋 复制全部</button>
+          <button class="mh-btn" data-copy-target="backend-logs" data-copy-tail="1" type="button">📋 只复制最后一条</button>
+          <button class="mh-btn" data-pause-target="backend-logs" type="button">⏸ 暂停刷新</button>
+          <span class="desc" style="margin: 0;">选中文字时刷新会自动让位，不会打断你复制</span>
+        </div>
+        <pre id="backend-logs" style="height: 450px; color: #a6e22e; background: #25232A; padding: 12px; border-radius: 8px; overflow-y: auto; font-size: 13px; margin: 0; white-space: pre-wrap; user-select: text; -webkit-user-select: text;">加载中...</pre>
       </div>
     </div>
   </main>
@@ -965,6 +1198,7 @@
   <script src="static/lxmusic.js"></script>
   <script src="static/musicfree.js"></script>
   <script src="static/expert.js"></script>
+  <script src="static/qa.js"></script>
 
   <script>
   /* ==========================================
@@ -980,6 +1214,106 @@
   let debugInterval = null;
   let debugWs = null;
   let rawWsLogs = [];
+  const logPaused = {};   // 手动暂停（点「⏸ 暂停刷新」）
+
+  /* ==========================================
+     🧰 日志框工具：判重写入 + 让位选区 + 复制
+     ------------------------------------------
+     为什么以前难复制：每 2 秒无条件重写 textContent，
+     手选到一半就被刷掉，选区直接消失。
+     现在三条规则：
+       1) 内容与上次一致 → 一个字都不动（选区天然保住）
+       2) 用户此刻在框里有选区 → 本轮跳过写入
+       3) 想长期挑日志 → 点「⏸ 暂停刷新」
+     ========================================== */
+  function hasSelectionInside(el) {
+    try {
+      const sel = window.getSelection();
+      if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+      for (let i = 0; i < sel.rangeCount; i++) {
+        if (el.contains(sel.getRangeAt(i).commonAncestorContainer)) return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  /** 返回 true 表示这次真的写进去了（便于调用方决定要不要滚到底部） */
+  function renderLogText(el, text, autoScroll) {
+    if (!el) return false;
+    if (logPaused[el.id]) return false;
+    if (hasSelectionInside(el)) return false;
+    if (el.textContent === text) return false;
+    const atBottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 10;
+    el.textContent = text;
+    if (autoScroll && atBottom) el.scrollTop = el.scrollHeight;
+    return true;
+  }
+
+  async function copyText(text) {
+    // 首选 Clipboard API；宿主 WebView 里可能没有权限/非安全上下文 → 回落 execCommand
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (e) {}
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.position = 'fixed';
+      ta.style.top = '-1000px';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      ta.setSelectionRange(0, ta.value.length);
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function flashBtn(btn, text) {
+    const old = btn.getAttribute('data-old-text') || btn.innerText;
+    btn.setAttribute('data-old-text', old);
+    btn.innerText = text;
+    btn.disabled = true;
+    setTimeout(() => { btn.innerText = old; btn.disabled = false; }, 1600);
+  }
+
+  document.addEventListener('click', function (e) {
+    const btn = e.target && e.target.closest ? e.target.closest('[data-copy-target],[data-pause-target]') : null;
+    if (!btn) return;
+
+    const copyId = btn.getAttribute('data-copy-target');
+    if (copyId) {
+      const el = document.getElementById(copyId);
+      if (!el) return;
+      let text = el.textContent || '';
+      // 「只复制最后一条」：日志是 [时间] 开头的一行行文本，取最后一条非空行
+      if (btn.getAttribute('data-copy-tail') === '1') {
+        const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+        text = lines.length ? lines[lines.length - 1] : '';
+      }
+      if (!text) { flashBtn(btn, '（暂无内容）'); return; }
+      copyText(text).then(ok => {
+        const n = text.split('\n').length;
+        flashBtn(btn, ok ? `✅ 已复制 ${n} 行` : '❌ 复制失败');
+        if (!ok) window.prompt('浏览器拒绝了剪贴板访问，请手动复制下面的内容：', text);
+      });
+      return;
+    }
+
+    const pauseId = btn.getAttribute('data-pause-target');
+    if (pauseId) {
+      logPaused[pauseId] = !logPaused[pauseId];
+      btn.innerText = logPaused[pauseId] ? '▶️ 继续刷新' : '⏸ 暂停刷新';
+      btn.setAttribute('data-old-text', btn.innerText);
+      // 恢复后无需特殊处理：下一轮轮询发现内容变了就会重画（判重逻辑保证只写一次）
+    }
+  });
 
   window.startDebugSession = function() {
     const wsLogsEl = document.getElementById('ws-logs');
@@ -991,9 +1325,7 @@
         try {
           const res = await window.SongloftPlugin.apiGet('/logs');
           if (res && res.logs && res.logs.length > 0) {
-            const isScrolledToBottom = backendLogsEl.scrollHeight - backendLogsEl.clientHeight <= backendLogsEl.scrollTop + 10;
-            backendLogsEl.textContent = res.logs.join('\n');
-            if (isScrolledToBottom) backendLogsEl.scrollTop = backendLogsEl.scrollHeight;
+            renderLogText(backendLogsEl, res.logs.join('\n'), true);
           } else {
              if (backendLogsEl.textContent === "加载中...") backendLogsEl.textContent = "暂无日志...";
           }
@@ -1028,9 +1360,7 @@
               if (text) {
                 rawWsLogs.push(`[${new Date().toLocaleTimeString()}] [${msg.data.device_name || '小爱音箱'}] ${text}`);
                 if (rawWsLogs.length > 50) rawWsLogs.shift();
-                const isScrolledToBottom = wsLogsEl.scrollHeight - wsLogsEl.clientHeight <= wsLogsEl.scrollTop + 10;
-                wsLogsEl.textContent = rawWsLogs.join('\n');
-                if (isScrolledToBottom) wsLogsEl.scrollTop = wsLogsEl.scrollHeight;
+                renderLogText(wsLogsEl, rawWsLogs.join('\n'), true);
               }
             }
           } catch (err) {}

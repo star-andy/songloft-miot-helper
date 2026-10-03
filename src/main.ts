@@ -5,11 +5,36 @@ import { setupWebDAVRoutes, searchWebDavSongs } from './webdav';
 import { searchLxMusicSongs } from './lxmusic';
 import { searchMusicFreeSongs, searchMusicFreePlaylists } from './musicfree';
 import { searchExpertSongs } from './expert';
+import { askLlm, formatNow, normalizeNativeAnswer, fetchModelList, judgeNativeAnswer, QA_DEFAULTS, NATIVE_FAIL_PATTERNS } from './qa';
 
 const router = createRouter();
 let wsClient: any = null;
 const TWIN_PLUGIN_ID = 'iwebplayer';
 let cachedServerHost = '';
+let cachedQaConfig: any = null;
+
+// 🔢 问答接管防抢话序号（按设备分片）：连说两句时，旧请求的结果作废
+const qaRequestSeq = new Map<string, number>();
+
+// 🗨️ 最近一条小爱原生回答（按设备分片）：既作大模型的参考上下文，也用于判定「小爱答没答上来」。
+//    真机实测：它与 query 在同一条 ws 推送里一并到达，所以命中口令时通常已经拿得到。
+//    ⚠️ 必须带时间戳：不带的话，上一轮的回答会一直留在表里，被当成这一轮的回答来判定
+//    （补位模式下会因此误判「小爱答上来了」而永远不接管）。
+const lastNativeAnswer = new Map<string, { text: string; at: number }>();
+const NATIVE_ANSWER_TTL_MS = 8000;
+
+function setNativeAnswer(scope: string, text: any) {
+    const t = String(text == null ? '' : text).trim();
+    if (!t) { lastNativeAnswer.delete(scope); return; } // 这一轮没抓到就清空，绝不留下上一轮的
+    lastNativeAnswer.set(scope, { text: t, at: Date.now() });
+}
+
+function getNativeAnswer(scope: string): string {
+    const hit = lastNativeAnswer.get(scope);
+    if (!hit) return '';
+    if (Date.now() - hit.at > NATIVE_ANSWER_TTL_MS) return ''; // 过期的上一轮回答，不能拿来判定
+    return hit.text;
+}
 
 // ==========================================
 // 🌟 全局默认配置常量 (单点事实)
@@ -48,6 +73,9 @@ function cancelAllTimers(accountId: string, deviceId: string) {
         clearTimeout(failedSoundTimers.get(key));
         failedSoundTimers.delete(key);
     }
+    // ⚠️ 打断窗口也必须一起收手：否则用户刚问完天气、紧接着点一首歌，
+    //    窗口还没跑完就会把音乐播放一遍遍掐掉。
+    cancelStopBurst(key);
 }
 
 // ⏱️ 启动 8 秒前置提示音超时定时器 (满8秒仅 stop 打断，不触发失败音，后台搜索继续)
@@ -141,30 +169,130 @@ function setupCommSyncListeners() {
 }
 
 // 🛑 下发小爱音箱停止播放指令
-async function stopMiotPlayer(accountId: string, deviceId: string) {
+// ------------------------------------------------------------------
+// 两个端点语义不同，都要打：
+//   /miot/mina/stop   —— 官方 miot 插件的打断动作走的就是这条（minaService.stopPlay，
+//                        打断的是「小爱的语音播报」）；
+//   /miot/player/stop —— 音乐播放器的停止（我们此前只打了这条）。
+// 真机上哪个端点能压住小爱的原生应答无法离线确定，索性两个并打，
+// 任一返回 2xx 即视为打断成功（另一个失败不算整体失败，避免误报）。
+async function stopMiotPlayer(accountId: string, deviceId: string, opts?: { quiet?: boolean }): Promise<boolean> {
+    const quiet = !!(opts && opts.quiet);
+
     try {
         const hostUrl = await songloft.plugin.getHostUrl();
         const token = await songloft.plugin.getToken();
-        const url = `${hostUrl}/api/v1/jsplugin/miot/player/stop?account_id=${accountId}&device_id=${deviceId}`;
+        const headers = {
+            'Authorization': `Bearer ${token}`,
+            'Content-Type': 'application/json',
+            'X-Fetch-Timeout-Ms': '1500'
+        };
+        const body = JSON.stringify({ account_id: accountId, device_id: deviceId });
+        const paths = [
+            '/api/v1/jsplugin/miot/mina/stop',
+            '/api/v1/jsplugin/miot/player/stop'
+        ];
 
-        const res = await fetch(url, {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${token}`,
-                'Content-Type': 'application/json',
-                'X-Fetch-Timeout-Ms': '1500'
-            },
-            body: JSON.stringify({ account_id: accountId, device_id: deviceId })
+        let ok = false;
+        const results = await Promise.all(paths.map(async (p) => {
+            const url = `${hostUrl}${p}?account_id=${accountId}&device_id=${deviceId}`;
+            try {
+                const res = await fetch(url, { method: 'POST', headers, body });
+                if (res.ok) return 'ok';
+                return `HTTP ${res.status}`;
+            } catch (e) {
+                return `异常 ${e}`;
+            }
+        }));
+
+        results.forEach((r, i) => {
+            if (r === 'ok') ok = true;
+            else if (!quiet) pushDebugLog(`⚠️ 停止指令 ${paths[i].split('/').slice(-2).join('/')} 未成功: ${r}`);
         });
 
-        if (res.ok) {
-            pushDebugLog(`🛑 已下发停止指令，终止音箱播放`);
-        } else {
-            pushDebugLog(`⚠️ 下发停止指令失败 (HTTP ${res.status})`);
+        if (ok) {
+            if (!quiet) pushDebugLog(`🛑 已下发停止指令，终止音箱播放`);
+        } else if (!quiet) {
+            pushDebugLog(`⚠️ 两个停止端点均未成功，本次未能打断`);
         }
+        return ok;
     } catch (e) {
-        pushDebugLog(`⚠️ 执行停止播放异常: ${e}`);
+        if (!quiet) pushDebugLog(`⚠️ 执行停止播放异常: ${e}`);
+        return false;
     }
+}
+
+/** 取整并夹在 [min, max] 内，非法值回落到 def */
+function clampInt(v: any, min: number, max: number, def: number): number {
+    const n = Math.round(Number(v));
+    if (!isFinite(n)) return def;
+    return Math.min(max, Math.max(min, n));
+}
+
+// ==========================================
+// 🔇 连续打断窗口（stop burst）
+// ------------------------------------------------------------------
+// 为什么单发一次不够：
+//   小爱原生回答与 query 在**同一条 ws 推送**里一并到达（真机实测），
+//   但设备**何时起播**对我们不可见 —— 可能在我们拿到文本帧之前就已开念，
+//   也可能还要再等 1~2 秒才起播。单发 stop 若正好落在「还没起播」的空档上，
+//   就是一次空转；设备随后照常把原生回答念完，我们的 TTS 再跟上，
+//   用户听到的就是「先说一遍小爱的、再说一遍模型的」。
+// 做法：
+//   命中口令后立刻打一发，之后每 intervalMs 补一发，直到大模型结果就绪才收手。
+//   起播时机无论落在窗口内哪一点，都会被窗口里的下一次 stop 打掉。
+// ==========================================
+interface StopBurst {
+    /** 已下发的停止次数 */
+    count: number;
+    /** 收手（不会再补发） */
+    stop: () => void;
+}
+
+const stopBursts = new Map<string, StopBurst>();
+
+/** 收掉指定设备的打断窗口（若有）。新交互开始时调用，防止误伤后续播放。 */
+function cancelStopBurst(scope: string) {
+    const b = stopBursts.get(scope);
+    if (b) {
+        b.stop();
+        stopBursts.delete(scope);
+    }
+}
+
+function startStopBurst(accountId: string, deviceId: string, scope: string, mySeq: number, intervalMs: number, maxMs: number): StopBurst {
+    let stopped = false;
+    let timer: any = null;
+    const t0 = Date.now();
+
+    const burst: StopBurst = {
+        count: 0,
+        stop: () => {
+            stopped = true;
+            if (timer) { clearTimeout(timer); timer = null; }
+        }
+    };
+
+    const tick = async () => {
+        if (stopped) return;
+        // 期间用户又提了新问题 → 本窗口作废
+        if (qaRequestSeq.get(scope) !== mySeq) { stopped = true; return; }
+
+        burst.count++;
+        const tickStart = Date.now();
+        await stopMiotPlayer(accountId, deviceId, { quiet: burst.count > 1 }); // 只让第一发打日志
+
+        if (stopped) return;
+        if (Date.now() - t0 >= maxMs) { stopped = true; return; }
+
+        // 扣掉本次下发本身的往返耗时（真机约 130ms），让「间隔」是两发之间的真实时间，
+        // 而不是「间隔 + 往返」。若单次耗时比间隔还长，就退化为「不重叠地连打」，不会堆积请求。
+        const cost = Date.now() - tickStart;
+        timer = setTimeout(tick, Math.max(0, intervalMs - cost));
+    };
+
+    tick(); // 第一发立即出去
+    return burst;
 }
 
 // ⚠️ 播放失败提示音 (SongLoft_failed.3a76aaad.mp3) 并挂载 5 秒自动关停
@@ -467,6 +595,21 @@ function parseVoiceCommand(query: string) {
     }
     if (!best) return null;
 
+    // 🌟 问答接管：关键词只去掉口令词本身，不做平台词 / 动词 / 连词的剥离
+    //    （否则“问问怎么用百度搜索”会被误删成“怎么用百度”）
+    if (best.engine === 'qa') {
+        const qText = textToParse.split(matchedWord).join('').trim();
+        return {
+            type: 'qa', engine: 'qa', node: 'default',
+            quality: undefined, strategy: undefined,
+            platform: null, keyword: qText, matchedWord,
+            limit: 0,
+            shuffleFlag: false,
+            keywordOptional: false,
+            qaCfg: best.qaCfg
+        };
+    }
+
     // 3. 提取平台词并抠除
     const ep = extractPlatform(textToParse);
     let kw = ep.keyword.split(matchedWord).join('');
@@ -542,7 +685,7 @@ function parseVoiceCommand(query: string) {
 // ==========================================
 // 🚀 核心：全局意图路由表
 // ==========================================
-let voiceRoutes: Record<string, { type: string, engine: string, node: string, quality?: string, strategy?: string, limit?: number, shuffle?: boolean, fixedKeyword?: string, expertCfg?: any }> = {};
+let voiceRoutes: Record<string, { type: string, engine: string, node: string, quality?: string, strategy?: string, limit?: number, shuffle?: boolean, fixedKeyword?: string, expertCfg?: any, qaCfg?: any }> = {};
 
 async function rebuildVoiceRoutes() {
     try {
@@ -646,6 +789,20 @@ async function rebuildVoiceRoutes() {
                             expertCfg: cfg
                         };
                     }
+                }
+            }
+        }
+
+        // 🌟 挂载问答接管口令 (独立配置：xiaoai_qa_config)
+        const qaRaw = await songloft.storage.get('xiaoai_qa_config');
+        cachedQaConfig = null;
+        if (qaRaw && qaRaw !== 'null') {
+            try { cachedQaConfig = typeof qaRaw === 'string' ? JSON.parse(qaRaw) : qaRaw; } catch (e) { cachedQaConfig = null; }
+        }
+        if (cachedQaConfig && cachedQaConfig.enabled !== false && Array.isArray(cachedQaConfig.cmds)) {
+            for (const cmd of cachedQaConfig.cmds) {
+                if (cmd) {
+                    voiceRoutes[cmd] = { type: 'qa', engine: 'qa', node: 'default', limit: 0, qaCfg: cachedQaConfig };
                 }
             }
         }
@@ -817,9 +974,243 @@ async function createPushPlaylistAndPlay(songs: any[], accountId: string, device
     }
 }
 
+// ==========================================
+// 🔓 自由补位（可选，默认关闭）
+// ------------------------------------------------------------------
+// 场景：用户没喊「问问/问一下」口令，只是正常跟小爱聊天，结果小爱答不上来
+//      （"对不起，我还在学习中"），此时也允许大模型补位。
+// 为什么默认关闭：没有口令词就没有"这条指令归我"的边界，
+//      一旦开着，普通对话也可能被抢走。只在「小爱明确答不上来」时才接管，
+//      正常指令（下一首/暂停/天气…）小爱都有回答 → 判定为答上来了 → 不接管。
+// 为什么不与「全接管」模式共存：全接管的语义就是"每条命中口令的都要我的答案"，
+//      把它套到所有对话上会变成无条件抢占。
+// ==========================================
+function tryFreeFallback(query: string, accountId: string, deviceId: string) {
+    try {
+        const cfg = cachedQaConfig || {};
+        if (cfg.enabled === false) return;
+        if (!cfg.freeFallback) return;
+        if ((cfg.qaMode === 'takeover' ? 'takeover' : 'fallback') !== 'fallback') return;
+
+        const scope = `${accountId}_${deviceId}`;
+        const v = judgeNativeAnswer(getNativeAnswer(scope), cfg.fallbackPatterns);
+        // 没抓到回答 ≠ 答不上来：小爱可能只是这轮没理（还在处理/别的设备），别抢
+        if (v.usable || v.reason === 'empty') return;
+
+        const why = v.reason === 'matched' ? `命中「${v.matched}」` : v.reason;
+        pushDebugLog(`🔓 [自由补位] 未喊口令但小爱答不上来（${why}），交给大模型: "${query.slice(0, 40)}"`);
+
+        handleVoiceCommand('qa', 'qa', 'default', query, accountId, deviceId)
+            .catch(async () => { await playFailedSound(accountId, deviceId); })
+            .finally(() => { pushDebugLog('========================================'); });
+    } catch (e) {
+        pushDebugLog(`⚠️ 自由补位异常: ${e}`);
+    }
+}
+
+// 🔔 问答接管的前置提示：确定要调大模型了，先说一声，别让用户以为没听见。
+//    ⚠️ 必须与「连续打断窗口」互斥 —— 窗口每 intervalMs 就补一发 stop，
+//    会把插件自己刚播出去的提示语掐掉。调用方据此强制走单发打断。
+async function playAiHint(accountId: string, deviceId: string, cfg: any, mode: 'off' | 'tts' | 'sound') {
+    if (mode === 'off') return;
+    try {
+        if (mode === 'sound') {
+            pushDebugLog(`🔔 [问答] 前置提示音: ${cachedGlobalSettings.hitSound || '（全局未配置）'}（提示期间改用单发打断）`);
+            playHitSound(accountId, deviceId);
+            return;
+        }
+        const text = String(cfg.aiHintText || '').trim() || QA_DEFAULTS.aiHintText;
+        const hostUrl = await songloft.plugin.getHostUrl();
+        const token = await songloft.plugin.getToken();
+        const res = await fetch(`${hostUrl}/api/v1/jsplugin/miot/mina/tts`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${token}`,
+                'Content-Type': 'application/json',
+                'X-Fetch-Timeout-Ms': '5000'
+            },
+            body: JSON.stringify({ account_id: accountId, device_id: deviceId, text })
+        });
+        if (res.ok) {
+            pushDebugLog(`🔔 [问答] 前置语音提示: "${text}"（提示期间改用单发打断）`);
+        } else {
+            pushDebugLog(`⚠️ [问答] 前置语音提示下发失败 (HTTP ${res.status})，继续等答案`);
+        }
+    } catch (e) {
+        pushDebugLog(`⚠️ [问答] 前置提示异常: ${e}`);
+    }
+}
+
 // 🎯 语音口令处理总入口
 async function handleVoiceCommand(cmdType: string, engine: string, nodeName: string, rawKeyword: string, accountId: string, deviceId: string, quality?: string, strategy?: string, parsedPlatform?: string | null, shuffleFlag?: boolean, parsedLimit?: number, expertCfg?: any) {
     const doShuffle = !!shuffleFlag;
+
+    // 🔇 任何新口令进来，先收掉上一轮可能还开着的打断窗口：
+    //    否则「问完天气马上点歌」时，旧窗口会把刚起的音乐一遍遍掐掉。
+    cancelStopBurst(`${accountId}_${deviceId}`);
+
+    // === 问答接管处理分支 ===
+    // 链路：命中口令 → 打断小爱 → 缓冲 → 大模型整段生成 → TTS 播报
+    if (engine === 'qa') {
+        const question = (rawKeyword || '').trim();
+        if (!question) {
+            pushDebugLog('⚠️ [问答] 未捕获到问题内容');
+            await playFailedSound(accountId, deviceId);
+            return;
+        }
+
+        const qaCfg = cachedQaConfig || {};
+        cancelAllTimers(accountId, deviceId);
+
+        // 防抢话：同设备上后来的提问顶替先前的，避免两个回答串台播出
+        const scope = `${accountId}_${deviceId}`;
+        const mySeq = (qaRequestSeq.get(scope) || 0) + 1;
+        qaRequestSeq.set(scope, mySeq);
+
+        // 上一题若还留着打断窗口，先收手再换新的
+        cancelStopBurst(scope);
+
+        // ==== 接管时机判定：补位（默认）/ 全接管 ====
+        // 为什么要「补位」：真机实测连续下发 4 次停止指令，小爱的原生回答照样念完 ——
+        // 设备侧起播时机不可控，我们抢不过它。与其抢，不如只在它答不上来时才让大模型上。
+        const qaMode = qaCfg.qaMode === 'takeover' ? 'takeover' : 'fallback';
+
+        let nativeRaw = getNativeAnswer(scope);
+        if (qaMode === 'fallback' && !nativeRaw) {
+            // 回答通常与 query 同帧到达；万一慢一拍，最多再等这么久再判定（设 0 即不等）
+            const waitMs = clampInt(qaCfg.waitNativeMs, 0, 3000, QA_DEFAULTS.waitNativeMs);
+            const deadline = Date.now() + waitMs;
+            while (waitMs > 0 && Date.now() < deadline && !nativeRaw) {
+                await new Promise((r) => setTimeout(r, 100));
+                nativeRaw = getNativeAnswer(scope);
+            }
+        }
+
+        const verdict = qaMode === 'fallback'
+            // ⚠️ 这里必须传原始值：parsePatternList 会把 undefined 也变成 []，
+            //    而「没配过」(用默认表) 与「显式清空」(永不接管) 是两种语义，不能混。
+            ? judgeNativeAnswer(nativeRaw, qaCfg.fallbackPatterns)
+            : { usable: false, reason: 'takeover' as const, matched: '' };
+
+        if (verdict.usable) {
+            // 小爱答上来了 → 闭嘴。不下发任何 stop、不请求大模型，用户只听到一遍。
+            pushDebugLog(`🙊 [问答] 小爱已作答（${nativeRaw.length} 字），本次不接管: ${nativeRaw.slice(0, 40)}`);
+            return;
+        }
+
+        // 小爱自己的回答作为参考上下文（走到这儿说明它没答上来；
+        // 但全接管模式下它可能是答对了的 —— 不带它会出现「掐掉正确的、播出错误的」，
+        // 例：问天气，小爱有实时数据答得对，大模型没实时信息就会编，真机已复现）。
+        const nativeRef = normalizeNativeAnswer(nativeRaw);
+
+        const startedAt = Date.now();
+        const modeTag = qaMode === 'fallback' ? '补位接管' : '全部接管';
+        const failTag = verdict.reason === 'matched' ? `｜小爱答不上来: 命中「${verdict.matched}」` : '';
+        const refTag = nativeRef ? `｜带原生回答 ${nativeRef.length} 字作参考` : '｜无原生回答可参考';
+        pushDebugLog(`🧠 [问答] 命中提问: "${question}"（${modeTag}${failTag}${refTag}）`);
+
+        // 1. 先发大模型请求（不 await），与「打断小爱」并行 —— 省掉串行的 ~400ms
+        const llmPromise = askLlm(qaCfg, question, pushDebugLog, { now: formatNow() }, nativeRef)
+            .catch((e) => { pushDebugLog(`⚠️ [问答] 引擎异常: ${e}`); return null; });
+
+        // 2. 打断小爱自己的应答。
+        //    burst：整个等待大模型的窗口内反复 stop —— 设备何时起播不可控，
+        //           单发 stop 可能落在起播前的空档上而空转（详见 startStopBurst 注释）。
+        //    once：只打一发。
+        //    ⚠️ 开了前置提示就**必须**走 once：提示语是我们自己刚播的 TTS，
+        //    窗口的补发 stop 会把它连播到一半掐掉。
+        const hintMode = (qaCfg.aiHint === 'tts' || qaCfg.aiHint === 'sound') ? qaCfg.aiHint as 'tts' | 'sound' : 'off';
+        const interruptMode = (hintMode !== 'off' || qaCfg.interruptMode === 'once') ? 'once' : 'burst';
+        const intervalMs = clampInt(qaCfg.interruptIntervalMs, 150, 3000, 350);
+        const llmTimeoutMs = clampInt(qaCfg.timeoutMs, 3000, 60000, 12000);
+
+        let burst: StopBurst | null = null;
+        if (interruptMode === 'burst') {
+            // 窗口上限取 min(大模型超时, 8s)：跑太久没必要（原生应答在窗口开头就该被打掉了），
+            // 而且能缩小「窗口还开着、用户已经转去点歌」时的误伤面。
+            const burstMaxMs = Math.min(llmTimeoutMs, 8000);
+            burst = startStopBurst(accountId, deviceId, scope, mySeq, intervalMs, burstMaxMs);
+            stopBursts.set(scope, burst);
+        } else {
+            await stopMiotPlayer(accountId, deviceId);
+        }
+
+        // 2.5 前置提示：单发 stop 已落地，这里发提示不会被自己的 stop 掐掉。
+        //     与大模型请求并行，不额外增加端到端延迟。
+        const hintAt = Date.now();
+        if (hintMode !== 'off') {
+            await playAiHint(accountId, deviceId, qaCfg, hintMode);
+        }
+
+        const answer = await llmPromise;
+
+        // 3. 收手：停掉打断窗口，报一下总共打了几发（便于真机调间隔）
+        if (burst) {
+            burst.stop();
+            // ⚠️ 只清理自己的那一份：期间若有新提问进来，它已经在表里放了自己的窗口，
+            //    无条件 delete 会把新窗口从表里摘掉，导致后续"收手闸门"再也找不到它。
+            if (stopBursts.get(scope) === burst) stopBursts.delete(scope);
+            if (burst.count > 1) {
+                pushDebugLog(`🔇 [问答] 打断窗口共下发 ${burst.count} 次停止指令（间隔 ${intervalMs}ms）`);
+            }
+        }
+
+        if (!answer) {
+            await playFailedSound(accountId, deviceId);
+            return;
+        }
+
+        // 若期间用户又提了新问题，本次结果作废，不再抢播
+        if (qaRequestSeq.get(scope) !== mySeq) {
+            pushDebugLog('🚫 [问答] 本次回答已被更新的提问顶替，放弃播报');
+            return;
+        }
+
+        // 4. 收尾再播答案 TTS。两种走法：
+        //    · 没提示语 → 补一发 stop 清掉可能刚起播的原生回答 + 300ms 缓冲（两者并行）；
+        //    · 有提示语 → **绝不能再下发 stop**（会把自己的提示掐掉），
+        //      改为等提示语播满 aiHintHoldMs 再送答案；大模型比提示语还快时也至少留 300ms。
+        if (hintMode !== 'off') {
+            const holdMs = clampInt(qaCfg.aiHintHoldMs, 500, 6000, QA_DEFAULTS.aiHintHoldMs);
+            const waitMs = Math.max(300, hintAt + holdMs - Date.now());
+            await new Promise((r) => setTimeout(r, waitMs));
+        } else {
+            // 打断窗口的最后一发可能已经过去 intervalMs，期间起播的原生回答要靠这一发打掉；
+            // 300ms 缓冲是官方 miot 插件同款做法，规避“打断后立即播 TTS 被吞”。
+            await Promise.all([
+                stopMiotPlayer(accountId, deviceId, { quiet: true }),
+                new Promise((r) => setTimeout(r, 300))
+            ]);
+        }
+
+        // 5. TTS 播报回答
+        try {
+            const hostUrl = await songloft.plugin.getHostUrl();
+            const token = await songloft.plugin.getToken();
+            pushDebugLog(`📣 [问答] 播报回答: ${answer}`);
+
+            const res = await fetch(`${hostUrl}/api/v1/jsplugin/miot/mina/tts`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json',
+                    'X-Fetch-Timeout-Ms': '5000'
+                },
+                body: JSON.stringify({ account_id: accountId, device_id: deviceId, text: answer })
+            });
+
+            if (!res.ok) {
+                pushDebugLog(`⚠️ [问答] TTS 下发失败 (HTTP ${res.status})`);
+                await playFailedSound(accountId, deviceId);
+            } else {
+                pushDebugLog(`✅ [问答] 回答已下发（${answer.length} 字，端到端 ${Date.now() - startedAt}ms）`);
+            }
+        } catch (e) {
+            pushDebugLog(`⚠️ [问答] TTS 异常: ${e}`);
+            await playFailedSound(accountId, deviceId);
+        }
+        return;
+    }
 
     // === 专家模式处理分支 ===
     if (engine === 'expert') {
@@ -1162,6 +1553,19 @@ async function connectWebSocket() {
             try {
                 const msg = JSON.parse(event.data);
                 if (msg.type === 'message' && msg.data) {
+                    // 🌟 小爱自己的回答本来就在推送里（扁平结构 answer / 旧嵌套 response.answer[0].content），
+                    //    此前只读了 query 未用它。记录进诊断日志，便于后续做“按小爱回答质量决定是否接管”。
+                    const xiaoaiAnswer = msg.data.answer
+                        || (msg.data.message?.response?.answer?.[0]?.content);
+                    if (xiaoaiAnswer && typeof xiaoaiAnswer === 'string' && xiaoaiAnswer.trim()) {
+                        // 缓存起来：① 作为大模型的参考上下文 ② 用于判定「这一轮小爱答没答上来」
+                        setNativeAnswer(`${msg.data.account_id}_${msg.data.device_id}`, xiaoaiAnswer);
+                        pushDebugLog(`🗨️ 小爱原生回答: ${xiaoaiAnswer.trim().slice(0, 80)}`);
+                    } else {
+                        // 本轮没有回答 → 必须清空，否则补位模式会拿上一轮的回答当成本轮判定依据
+                        setNativeAnswer(`${msg.data.account_id}_${msg.data.device_id}`, '');
+                    }
+
                     // 🌟 兼容新版 MIoT 插件扁平化结构 (直接读取 query 字段)
                     let fullText = msg.data.query;
 
@@ -1188,7 +1592,10 @@ async function connectWebSocket() {
                                 } else {
                                     pushDebugLog(`🎯 命中口令词: [${parsed.matchedWord}]，该指令无需后续关键词，直接执行${platDesc}`);
                                 }
-                                playHitSound(msg.data.account_id, msg.data.device_id);
+                                // 🌟 问答接管不播前置提示音：避免与后续 TTS 抢播放通道
+                                if (parsed.engine !== 'qa') {
+                                    playHitSound(msg.data.account_id, msg.data.device_id);
+                                }
 
                                 // 传入解析好的参数
                                 handleVoiceCommand(parsed.type, parsed.engine, parsed.node, parsed.keyword, msg.data.account_id, msg.data.device_id, parsed.quality, parsed.strategy, parsed.platform, parsed.shuffleFlag, parsed.limit, parsed.expertCfg)
@@ -1214,7 +1621,9 @@ async function connectWebSocket() {
                                     try {
                                         const hostUrl = await songloft.plugin.getHostUrl();
                                         const token = await songloft.plugin.getToken();
-                                        const ttsText = `语音助手只听到，${parsed.matchedWord}，没有后续内容，请重试。`;
+                                        const ttsText = parsed.engine === 'qa'
+                                            ? `请问你想问什么？`
+                                            : `语音助手只听到，${parsed.matchedWord}，没有后续内容，请重试。`;
 
                                         await fetch(`${hostUrl}/api/v1/jsplugin/miot/mina/tts`, {
                                             method: 'POST',
@@ -1230,7 +1639,16 @@ async function connectWebSocket() {
                                     }
                                 })();
                             }
+                        } else if (xiaoaiAnswer) {
+                            // ⚪ 没命中任何口令 —— 以前这里一声不吭，用户只看到"模型没被调用"，
+                            //    完全猜不出原因。小爱有回答时才记（那种情况用户才会关心）。
+                            const ans = String(xiaoaiAnswer).trim();
+                            pushDebugLog(`⚪ 未命中任何口令（不接管）: "${trimmedText.slice(0, 40)}" ｜ 小爱答: ${ans.slice(0, 24)}`);
+                            tryFreeFallback(trimmedText, msg.data.account_id, msg.data.device_id);
                         }
+                    } else if (xiaoaiAnswer) {
+                        // 这一帧只有回答、没有指令文本 → 无法路由，但必须说清楚，否则日志看起来像"卡住了"
+                        pushDebugLog(`⚠️ 收到原生回答但本帧没有指令文本，无法路由: ${String(xiaoaiAnswer).trim().slice(0, 40)}`);
                     }
                 }
             } catch (e) { }
@@ -1293,7 +1711,7 @@ router.post('/store', async (req) => {
             await updateGlobalSettingsCache();
         }
 
-        if (key === 'xiaoai_dav_configs' || key === 'xiaoai_lx_configs' || key === 'xiaoai_mf_configs' || key === 'xiaoai_expert_configs') rebuildVoiceRoutes();
+        if (key === 'xiaoai_dav_configs' || key === 'xiaoai_lx_configs' || key === 'xiaoai_mf_configs' || key === 'xiaoai_expert_configs' || key === 'xiaoai_qa_config') rebuildVoiceRoutes();
 
         let syncKey = key;
         if (key === 'webdav_config') syncKey = 'iwebplayer.webdav';
@@ -1325,6 +1743,55 @@ router.delete('/store', async (req) => {
         return jsonResponse({ ret: "OK" });
     } catch (error) {
         return jsonResponse({ error: "删除配置失败: " + String(error) }, 500);
+    }
+});
+
+// 🧠 问答接管：拉取可用模型列表（前端「获取模型」按钮调用，不落盘）
+// 由 chat/completions 地址推导 /models，省得用户手敲模型名。
+router.post('/qa/models', async (req) => {
+    try {
+        const body = req.body ? JSON.parse(typeof req.body === 'string' ? req.body : String.fromCharCode.apply(null, Array.from(req.body as Uint8Array))) : {};
+        const r = await fetchModelList(String(body.apiUrl || ''), String(body.apiKey || ''), pushDebugLog);
+        return jsonResponse(r);
+    } catch (e) {
+        return jsonResponse({ ok: false, error: String(e), models: [] }, 500);
+    }
+});
+
+// 🧠 问答接管：连通性自检（前端“测试连接”按钮调用，不落盘、不影响线上配置）
+router.post('/qa/test', async (req) => {
+    try {
+        const body = req.body ? JSON.parse(typeof req.body === 'string' ? req.body : String.fromCharCode.apply(null, Array.from(req.body as Uint8Array))) : {};
+        const question = String(body.question || '你好，用一句话打个招呼');
+
+        const logs: string[] = [];
+        const answer = await askLlm(body, question, (m) => { logs.push(m); pushDebugLog(m); });
+
+        return jsonResponse({ ok: !!answer, answer: answer || '', logs });
+    } catch (e) {
+        return jsonResponse({ ok: false, error: String(e), logs: [] }, 500);
+    }
+});
+
+// 🧠 问答接管：把后端的默认词表与默认值下发给前端（预填表单 / 「恢复默认」按钮用）
+//    放在后端是为了只有一份事实来源，避免前端再抄一份导致两边漂移。
+router.get('/qa/defaults', async () => {
+    return jsonResponse({
+        ok: true,
+        patterns: NATIVE_FAIL_PATTERNS,
+        waitNativeMs: QA_DEFAULTS.waitNativeMs
+    });
+});
+
+// 🧠 问答接管：试判一句「小爱的原生回答」算不算答上来了（不落盘、不调大模型）
+// 用途：在真机上拿真实回答调特征词表 —— 不用每次都对着音箱喊一遍。
+router.post('/qa/judge', async (req) => {
+    try {
+        const body = req.body ? JSON.parse(typeof req.body === 'string' ? req.body : String.fromCharCode.apply(null, Array.from(req.body as Uint8Array))) : {};
+        const v = judgeNativeAnswer(String(body.answer || ''), body.patterns);
+        return jsonResponse({ ok: true, ...v });
+    } catch (e) {
+        return jsonResponse({ ok: false, usable: false, reason: 'empty', matched: '', error: String(e) }, 500);
     }
 });
 

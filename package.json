@@ -1,12 +1,15 @@
 {
   "name": "miot-helper",
-  "version": "0.8.0",
-  "description": "小爱音箱语音口令扩展，自定义语音搜索，播放LXMusic、WebDAV、MusicFree中歌单和歌曲",
+  "version": "0.9.6",
+  "description": "小爱音箱语音口令扩展，自定义语音搜索，播放LXMusic、WebDAV、MusicFree中歌单和歌曲，支持大模型问答接管",
   "private": true,
   "scripts": {
     "build": "songloft-plugin build",
     "dev": "songloft-plugin dev",
     "validate": "songloft-plugin validate",
+    "test:burst": "node test/interrupt-burst.test.mjs",
+    "test:fallback": "node test/native-fallback.test.mjs",
+    "test": "node test/interrupt-burst.test.mjs && node test/native-fallback.test.mjs",
     "publish:release": "songloft-plugin publish"
   },
   "devDependencies": {
